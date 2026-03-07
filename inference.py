@@ -42,6 +42,44 @@ if __name__ == '__main__':
     parser.add_argument('--bbox_type', type=str, default='sorted', choices=['all', 'naive', 'sorted'], help='Type of detection bounding boxes filtering method.')
     parser.add_argument('--allow_resize', default=False, action='store_true', help='Allow resizing of detection sub-windows.')
     
+    # Temporal
+    parser.add_argument('--use_temporal', type=str, default='none',
+                        choices=['none', 'post_unet', 'bottleneck', 'dual', 'postdecoder', 'multiscale'],
+                        help='Temporal mode for ROI estimation.')
+    parser.add_argument('--temporal_hidden', type=int, default=16, help='Hidden channels for ConvGRU.')
+    parser.add_argument('--temporal_ks', type=int, default=3, help='Kernel size for ConvGRU.')
+    parser.add_argument('--temporal_weights', type=str, default=None, help='Path to trained temporal weights.')
+    parser.add_argument('--insertion_point', type=int, default=5, choices=[2, 3, 4, 5],
+                        help='Encoder layer for ConvGRU insertion (bottleneck mode).')
+
+    # Dual-GRU (Idea 1)
+    parser.add_argument('--shallow_hidden', type=int, default=16,
+                        help='Hidden channels for shallow GRU (dual mode).')
+    parser.add_argument('--shallow_point', type=int, default=2, choices=[2, 3, 4],
+                        help='Encoder layer for shallow GRU (dual mode).')
+
+    # Temporal Detection Heatmap (Idea 3)
+    parser.add_argument('--use_heatmap', default=False, action='store_true',
+                        help='Enable temporal detection heatmap for tiny objects.')
+    parser.add_argument('--heatmap_decay', type=float, default=0.85,
+                        help='Heatmap decay per frame.')
+    parser.add_argument('--heatmap_tiny_threshold', type=float, default=0.01,
+                        help='Relative size threshold for heatmap boosting.')
+    parser.add_argument('--heatmap_activation_threshold', type=float, default=0.3,
+                        help='Minimum heatmap value to activate.')
+                
+    # Adaptive windowing        
+    parser.add_argument('--use_adaptive_windowing', default=False, action='store_true',
+                        help='Enable object-centric windows for tiny tracked objects.')
+    parser.add_argument('--aw_tiny_threshold', type=float, default=0.01,
+                        help='Relative size threshold for adaptive windowing.')
+    parser.add_argument('--aw_min_window_ratio', type=float, default=0.5,
+                        help='Minimum window size as fraction of detector input.')
+    parser.add_argument('--aw_padding_factor', type=float, default=2.0,
+                        help='Padding multiplier around tracked object.')
+    parser.add_argument('--aw_max_extra_windows', type=int, default=5,
+                        help='Maximum extra object-centric windows per frame.')
+
     # general
     parser.add_argument('--cpu', default=False, action='store_true', help='Use CPU for inference.')
     parser.add_argument('--out_dir', type=str, default='detections', help='Output directory for results.')
@@ -82,7 +120,27 @@ if __name__ == '__main__':
         is_sequence = ds.is_sequential,
         device = device,
         bbox_type = args.bbox_type,
-        allow_resize = args.allow_resize
+        allow_resize = args.allow_resize,
+        # Temporal (bottleneck / post_unet)
+        use_temporal = args.use_temporal,
+        temporal_hidden = args.temporal_hidden,
+        temporal_ks = args.temporal_ks,
+        temporal_weights = args.temporal_weights,
+        insertion_point = args.insertion_point,
+        # Dual-GRU (Idea 1)
+        shallow_hidden = args.shallow_hidden,
+        shallow_point = args.shallow_point,
+        # Heatmap (Idea 3)
+        use_heatmap = args.use_heatmap,
+        heatmap_decay = args.heatmap_decay,
+        heatmap_tiny_threshold = args.heatmap_tiny_threshold,
+        heatmap_activation_threshold = args.heatmap_activation_threshold,
+        # Adaptive Windowing
+        use_adaptive_windowing = args.use_adaptive_windowing,
+        aw_tiny_threshold = args.aw_tiny_threshold,
+        aw_min_window_ratio = args.aw_min_window_ratio,
+        aw_padding_factor = args.aw_padding_factor,
+        aw_max_extra_windows = args.aw_max_extra_windows,
     )
 
     # Save configurations
@@ -150,6 +208,14 @@ if __name__ == '__main__':
                     img_det = torch.empty((0,6))
 
                 t1 = time.time()
+
+                # Update temporal heatmap with current detections (Idea 3)
+                if args.use_heatmap:
+                    roi_extractor.update_heatmap(
+                        detections=img_det.detach().cpu().numpy(),
+                        orig_shape=original_shape,
+                    )
+
                 roi_extractor.update_predictor(img_det.detach().cpu().numpy()[:, :-1])
                                                     
                 if args.debug:

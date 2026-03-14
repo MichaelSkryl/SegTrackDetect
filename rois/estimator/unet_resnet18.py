@@ -3,20 +3,6 @@ Exact PyTorch reimplementation of the segmentation_models_pytorch (SMP)
 Unet with ResNet18 encoder, matching the TorchScript models shipped with
 SegTrackDetect.
 
-The architecture was reverse-engineered from the TorchScript state_dict:
-  - Encoder: ResNet18 (conv1→bn1→relu→maxpool→layer1-4)
-  - Decoder: 5 SMP-style DecoderBlocks (Conv2dReLU + Identity attention)
-  - SegmentationHead: Conv2d(16→1, 3×3) — NO Sigmoid (moved to postprocessing)
-
-KEY FIX vs v3:
-  The original TorchScript model has Sigmoid baked into the SegmentationHead.
-  During training, this causes double-sigmoid and vanishing gradients. By
-  removing Sigmoid from our reimplementation and relying on the postprocessing
-  pipeline (with sigmoid_included=False), we get proper gradient flow through
-  the ConvGRU.
-
-  During inference, the postprocess function handles sigmoid + thresholding.
-
 Weight loading:
   The `load_from_torchscript()` method loads the encoder, decoder, and
   segmentation head weights from the original TorchScript `.pt` file.
@@ -32,23 +18,17 @@ import torch.nn.functional as F
 from .conv_gru import ConvGRUCell
 
 
-# ============================================================================
-# Encoder: ResNet18 (matching SMP's ResNetEncoder)
-# ============================================================================
+# Encoder: ResNet18
 
 class BasicBlock(nn.Module):
     """Standard ResNet BasicBlock (2 × 3×3 conv with skip connection)."""
 
-    expansion = 1
-
     def __init__(self, in_channels, out_channels, stride=1, downsample=None):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3,
-                               stride=stride, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3,
-                               padding=1, bias=False)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.downsample = downsample
 
@@ -68,12 +48,12 @@ class ResNetEncoder(nn.Module):
     ResNet18 encoder that produces feature maps at 5 scales.
 
     Returns (in forward order):
-        features[0]: input image (B, 3, H, W)        — not used by decoder
+        features[0]: input image (B, 3, H, W)
         features[1]: after conv1+bn1+relu (B, 64, H/2, W/2)
         features[2]: after layer1 (B, 64, H/4, W/4)
         features[3]: after layer2 (B, 128, H/8, W/8)
         features[4]: after layer3 (B, 256, H/16, W/16)
-        features[5]: after layer4 (B, 512, H/32, W/32)  ← bottleneck
+        features[5]: after layer4 (B, 512, H/32, W/32)
     """
 
     def __init__(self):
@@ -90,11 +70,8 @@ class ResNetEncoder(nn.Module):
 
     def _make_layer(self, in_ch, out_ch, num_blocks, stride):
         downsample = None
-        if stride != 1 or in_ch != out_ch:
-            downsample = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_ch),
-            )
+        if stride != 1 or in_ch != out_ch:  # Уменьшение разрешения входа skip connections в ResNet
+            downsample = nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False), nn.BatchNorm2d(out_ch),)
         layers = [BasicBlock(in_ch, out_ch, stride, downsample)]
         for _ in range(1, num_blocks):
             layers.append(BasicBlock(out_ch, out_ch))
@@ -122,9 +99,7 @@ class ResNetEncoder(nn.Module):
         return features
 
 
-# ============================================================================
-# Decoder: SMP-style decoder blocks
-# ============================================================================
+# Decoder
 
 class Conv2dReLU(nn.Sequential):
     """Conv2d + BatchNorm2d + ReLU — matches SMP's Conv2dReLU."""
@@ -212,24 +187,11 @@ class UnetDecoder(nn.Module):
         return x
 
 
-# ============================================================================
-# Segmentation Head — NO SIGMOID
-# ============================================================================
+# Segmentation Head
 
 class SegmentationHead(nn.Sequential):
     """
-    Conv2d(16→1, 3×3) — NO sigmoid applied here.
-
-    KEY FIX: The original TorchScript model bakes nn.Sigmoid() into index [2]
-    of this Sequential. Our reimplementation uses nn.Identity() instead, so
-    the model outputs raw logits. This is critical because:
-
-      1. During training, BCEWithLogitsLoss needs raw logits (not post-sigmoid)
-         for numerically stable gradients.
-      2. The postprocessing pipeline (unet_postprocess) handles sigmoid when
-         called with sigmoid_included=False.
-      3. When loading TorchScript weights, nn.Sigmoid() has no parameters,
-         so there's no shape mismatch — it just maps to our nn.Identity().
+    Conv2d(16→1, 3×3)
     """
 
     def __init__(self, in_channels=16, out_channels=1, kernel_size=3):
@@ -237,34 +199,26 @@ class SegmentationHead(nn.Sequential):
             nn.Conv2d(in_channels, out_channels, kernel_size,
                       padding=kernel_size // 2),
             nn.Identity(),   # placeholder (matches state_dict index [1])
-            nn.Identity(),   # was nn.Sigmoid() — now handled in postprocessing
+            nn.Identity(),
         )
 
 
-# ============================================================================
 # Bottleneck ConvGRU
-# ============================================================================
 
 class BottleneckConvGRU(nn.Module):
     """
     ConvGRU module operating at a configurable point in the UNet encoder.
 
-    Spatial sizes for each layer (SDS_tiny 64×96 input):
-        features[2] = layer1: 64ch,  16×24  ← RECOMMENDED for tiny
-        features[3] = layer2: 128ch,  8×12
-        features[4] = layer3: 256ch,  4×6
-        features[5] = layer4: 512ch,  2×3   ← too small!
-
     Spatial sizes for each layer (SDS_large 448×768 input):
         features[2] = layer1: 64ch,  112×192
         features[3] = layer2: 128ch,  56×96
         features[4] = layer3: 256ch,  28×48
-        features[5] = layer4: 512ch,  14×24  ← fine for large
+        features[5] = layer4: 512ch,  14×24
 
     Args:
         bottleneck_channels (int): Number of channels at the insertion point.
         hidden_channels (int): Number of channels in the GRU hidden state.
-        kernel_size (int): Kernel size for GRU convolutions. Default: 3.
+        kernel_size (int): Kernel size for GRU convolutions.
     """
 
     def __init__(self, bottleneck_channels=512, hidden_channels=64, kernel_size=3):
@@ -273,19 +227,15 @@ class BottleneckConvGRU(nn.Module):
         self.bottleneck_channels = bottleneck_channels
 
         # Project bottleneck_channels → hidden (reduce dimensionality for the GRU)
-        self.input_proj = nn.Conv2d(bottleneck_channels, hidden_channels,
-                                    kernel_size=1, bias=True)
+        self.input_proj = nn.Conv2d(bottleneck_channels, hidden_channels, kernel_size=1, bias=True)
 
         # ConvGRU cell operating in the hidden space
         self.gru_cell = ConvGRUCell(hidden_channels, hidden_channels, kernel_size)
 
         # Project hidden → bottleneck_channels (restore dimensionality)
-        self.output_proj = nn.Conv2d(hidden_channels, bottleneck_channels,
-                                     kernel_size=1, bias=True)
+        self.output_proj = nn.Conv2d(hidden_channels, bottleneck_channels, kernel_size=1, bias=True)
 
-        # Initialize alpha to -5.0 so sigmoid(-5) ≈ 0.007.
-        # The model starts as ~99.3% identity (pure pretrained features)
-        # and gradually learns to incorporate temporal information.
+        # The model starts as ~96% identity and gradually learns to incorporate temporal information.
         self.alpha = nn.Parameter(torch.tensor(-3.0))
 
         self._hidden_state = None
@@ -309,13 +259,8 @@ class BottleneckConvGRU(nn.Module):
         B, C, H, W = x.shape
 
         # Initialize hidden state if needed
-        if (self._hidden_state is None
-                or self._hidden_state.shape[0] != B
-                or self._hidden_state.shape[-2:] != (H, W)):
-            self._hidden_state = torch.zeros(
-                B, self.hidden_channels, H, W,
-                device=x.device, dtype=x.dtype,
-            )
+        if (self._hidden_state is None or self._hidden_state.shape[0] != B or self._hidden_state.shape[-2:] != (H, W)):
+            self._hidden_state = torch.zeros(B, self.hidden_channels, H, W, device=x.device, dtype=x.dtype,)
 
         # Project to hidden space
         h_in = self.input_proj(x)  # (B, hidden, H, W)
@@ -326,17 +271,14 @@ class BottleneckConvGRU(nn.Module):
         # Project back to original channel count
         temporal_out = self.output_proj(self._hidden_state)  # (B, C, H, W)
 
-        # Residual blend: sigmoid(alpha) controls temporal contribution
-        # alpha starts at -5.0 → sigmoid(-5) ≈ 0.007, so ~99.3% pretrained
+        # Контролируем, какое количество признаков от ConvGRU будет добавлено в итоговые выходные признаки слоя
         gate = torch.sigmoid(self.alpha)
         refined = (1 - gate) * x + gate * temporal_out
 
         return refined
 
 
-# ============================================================================
 # Complete Model: UNet + ConvGRU at configurable insertion point
-# ============================================================================
 
 class TemporalUnet(nn.Module):
     """
@@ -348,7 +290,7 @@ class TemporalUnet(nn.Module):
           → Encoder (ResNet18) → features at 5 scales
           → ConvGRU refines features[insertion_point]
           → Decoder (5 blocks with skip connections)
-          → SegmentationHead → raw logits (B, 1, H, W)   [NO sigmoid]
+          → SegmentationHead → raw logits (B, 1, H, W)
 
     The postprocessing pipeline applies sigmoid + threshold + dilation.
 
@@ -356,10 +298,10 @@ class TemporalUnet(nn.Module):
         gru_hidden (int): Hidden channels for the ConvGRU. Default: 64.
         gru_kernel (int): Kernel size for GRU convolutions. Default: 3.
         insertion_point (int): Which encoder feature to apply GRU to.
-            2 = layer1 output (64ch, H/4×W/4)   ← recommended for SDS_tiny
+            2 = layer1 output (64ch, H/4×W/4)
             3 = layer2 output (128ch, H/8×W/8)
             4 = layer3 output (256ch, H/16×W/16)
-            5 = layer4 output (512ch, H/32×W/32) ← default (for SDS_large)
+            5 = layer4 output (512ch, H/32×W/32)
     """
 
     # Maps insertion_point index → channel count at that encoder feature
@@ -386,9 +328,8 @@ class TemporalUnet(nn.Module):
         features = self.encoder(x)
 
         # Insert ConvGRU at the configured layer
-        features[self.insertion_point] = self.bottleneck_gru(
-            features[self.insertion_point]
-        )
+        # Здесь же и происходит использование временных признаков совместно с оригинальными
+        features[self.insertion_point] = self.bottleneck_gru(features[self.insertion_point])
 
         x = self.decoder(features)
         x = self.segmentation_head(x)
@@ -411,15 +352,12 @@ class TemporalUnet(nn.Module):
 
     def load_from_torchscript(self, torchscript_path):
         """
+        Используем для загрузки весов из оргинального .pt скрипта, по которому восстанавливалась модель.
+        Сопоставляем названия модулей, подтягиваем соответствующие натренированные параметры в новую сеть из старой
         Load pretrained weights from the original TorchScript .pt file.
 
         Maps the TorchScript state_dict keys to our architecture's keys.
         The ConvGRU parameters are left with their random initialization.
-
-        Note: The TorchScript model has nn.Sigmoid() as segmentation_head[2].
-        Our model has nn.Identity() there. Since nn.Sigmoid() has no parameters,
-        this causes no key mismatch — there's simply no parameter to load for
-        that layer.
 
         Args:
             torchscript_path (str): Path to the TorchScript model file.
@@ -462,6 +400,7 @@ class TemporalUnet(nn.Module):
 
         return gru_params
 
+    #Два варианта обучения модели, с замораживанием весов Unet и без (выполняются последовательно при тренировке)
     def freeze_unet(self):
         """
         Freeze all UNet parameters (encoder + decoder + segmentation head).

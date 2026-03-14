@@ -1,56 +1,5 @@
 """
-Training script for temporal ConvGRU — v4 with all critical fixes.
-
-Key fixes over v3:
-  1. No sigmoid in TemporalUnet SegmentationHead — output is raw logits.
-     Uses BCEWithLogitsLoss for numerically stable gradients.
-  2. Truncated BPTT: backprop per-frame, detach hidden state after each step.
-     Prevents memory explosion and gradient vanishing over long sequences.
-  3. GT supervision: train against ground-truth binary masks (from COCO bbox
-     annotations), with self-distillation as regularizer.
-     This lets the GRU IMPROVE on the teacher, not just copy it.
-  4. Alpha initialized to -5.0 (sigmoid ≈ 0.007) — near-identity start.
-  5. Proper insertion_point defaults: 2 for SDS_tiny, 5 for SDS_large.
-
-Loss = 0.7 * BCE(logits, gt_mask) + 0.2 * BCE(logits, teacher) + 0.1 * TC
-
-Usage:
-
-    # ===== Phase 1: GRU-only training =====
-
-    # SDS_large: bottleneck at layer4 (512ch, 14×24 — fine)
-    python train_bottleneck_temporal_v4.py \\
-        --data_root /SegTrackDetect/data/SeaDronesSee \\
-        --roi_model SDS_large --mode bottleneck \\
-        --insertion_point 5 --gru_hidden 64 \\
-        --epochs 30 --lr 1e-3 --seq_len 16 \\
-        --out_dir weights/temporal_large_v4 --phase 1
-
-    # SDS_tiny: bottleneck at layer1 (64ch, 16×24 — good spatial res)
-    python train_bottleneck_temporal_v4.py \\
-        --data_root /SegTrackDetect/data/SeaDronesSee \\
-        --roi_model SDS_tiny --mode bottleneck \\
-        --insertion_point 2 --gru_hidden 32 \\
-        --epochs 30 --lr 1e-3 --seq_len 16 \\
-        --out_dir weights/temporal_tiny_v4 --phase 1
-
-    # SDS_tiny: post_unet approach
-    python train_bottleneck_temporal_v4.py \\
-        --data_root /SegTrackDetect/data/SeaDronesSee \\
-        --roi_model SDS_tiny --mode post_unet --temporal_hidden 16 \\
-        --epochs 30 --lr 1e-3 --seq_len 16 \\
-        --out_dir weights/temporal_tiny_postunet_v4 --phase 1
-
-    # ===== Phase 2: End-to-end fine-tuning =====
-
-    python train_bottleneck_temporal_v4.py \\
-        --data_root /SegTrackDetect/data/SeaDronesSee \\
-        --roi_model SDS_large --mode bottleneck \\
-        --insertion_point 5 --gru_hidden 64 \\
-        --epochs 15 --lr 1e-4 --seq_len 16 \\
-        --out_dir weights/temporal_large_e2e_v4 --phase 2 \\
-        --gru_weights weights/temporal_large_v4/bottleneck_gru_best.pt \\
-        --unet_lr_scale 0.01
+Training script for temporal ConvGRU.
 """
 
 import argparse
@@ -124,7 +73,8 @@ def load_gt_mask(metadata, in_size, annotations, device):
 
 def build_annotation_index(ds):
     """
-    Build a mapping from image_id → list of bounding boxes.
+    Переводим лист с аннотациям в словарь для быстрого поиска рамок
+    Build a mapping from image_id to list of bounding boxes.
 
     Args:
         ds: DirectoryDataset instance.
@@ -155,6 +105,8 @@ def train():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--seq_len', type=int, default=16,
                         help='Consecutive frames per training subsequence.')
+    parser.add_argument('--bptt_steps', type=int, default=4,
+                        help='Number of frames to backpropagate through (Truncated BPTT).')
     parser.add_argument('--out_dir', type=str, default='weights/temporal_v4')
     parser.add_argument('--cpu', default=False, action='store_true')
 
@@ -210,14 +162,10 @@ def train():
 
     config = ESTIMATOR_MODELS[args.roi_model]
 
-    # ==================================================================
     # Build model based on mode
-    # ==================================================================
 
     if args.mode == 'post_unet':
-        # ----------------------------------------------------------
         # Post-UNet mode: frozen TorchScript UNet + trainable refiner
-        # ----------------------------------------------------------
         frozen_unet = torch.jit.load(config['weights'], map_location='cpu')
         frozen_unet.to(device)
         frozen_unet.eval()
@@ -241,9 +189,7 @@ def train():
         optimizer = optim.Adam(trainable_params, lr=args.lr)
 
     else:
-        # ----------------------------------------------------------
-        # Bottleneck mode — use TemporalUnet (NO sigmoid in head)
-        # ----------------------------------------------------------
+        # Bottleneck mode — use TemporalUnet
         model = TemporalUnet(
             gru_hidden=args.gru_hidden,
             gru_kernel=args.gru_kernel,
@@ -256,6 +202,7 @@ def train():
             gru_state = torch.load(args.gru_weights, map_location='cpu')
             model.bottleneck_gru.load_state_dict(gru_state)
 
+        # Выстраиваем обучение в зависимости от фазы (заморожены веса UNet или нет)
         if args.phase == 1:
             model.freeze_unet()
             trainable_params = [p for p in model.parameters()
@@ -273,9 +220,7 @@ def train():
 
         model.to(device)
 
-    # ==================================================================
     # Preprocessing & dataset
-    # ==================================================================
     from rois.estimator.configs.common import estimator_preprocess
     roi_transform = estimator_preprocess(**config['preprocess_args'])
 
@@ -291,9 +236,6 @@ def train():
     # BCEWithLogitsLoss for numerically stable training on raw logits
     bce_loss = nn.BCEWithLogitsLoss()
 
-    # ==================================================================
-    # Print summary
-    # ==================================================================
     print(f"\nTraining temporal module — Mode: {args.mode}, Phase {args.phase}")
     print(f"  Model: {args.roi_model} (input: {config['in_size']})")
 
@@ -319,9 +261,8 @@ def train():
         print(f"  UNet LR scale: {args.unet_lr_scale}")
     print()
 
-    # ==================================================================
-    # Training loop — truncated BPTT (per-frame backprop)
-    # ==================================================================
+
+    # Training loop — truncated BPTT
     best_loss = float('inf')
 
     for epoch in range(args.epochs):
@@ -349,6 +290,7 @@ def train():
             if len(seq_flist) < 2:
                 continue
 
+            # Проходим по кадрам в последовательности заданного размера
             for start_idx in range(0, len(seq_flist), args.seq_len):
                 sub_flist = seq_flist[start_idx:start_idx + args.seq_len]
                 if len(sub_flist) < 2:
@@ -366,8 +308,12 @@ def train():
                     model.reset_temporal_state()
 
                 prev_output = None
+                
+                optimizer.zero_grad()
+                accumulated_loss = 0
+                chunk_frames = 0
 
-                for img, metadata in dataloader:
+                for step_idx, (img, metadata) in enumerate(dataloader):
                     img = img.to(device).float()
                     img_roi = roi_transform(img)
 
@@ -378,60 +324,66 @@ def train():
                     if args.mode == 'post_unet':
                         # Teacher: frozen TorchScript UNet (post-sigmoid)
                         with torch.no_grad():
-                            teacher_out = frozen_unet(
-                                img_roi.to(unet_dtype))
+                            teacher_out = frozen_unet(img_roi.to(unet_dtype))
                             teacher_out = teacher_out.float()
 
                         # Student: frozen UNet output + trainable refiner
                         student_out = refiner(teacher_out)
 
                         # For post_unet mode, teacher is post-sigmoid.
-                        # The refiner output is a blend, not pure logits.
-                        # Use MSE for distillation, BCE for GT.
-                        distill_loss = nn.functional.mse_loss(
-                            student_out, teacher_out.detach())
-                        # For GT, apply sigmoid to convert teacher-scale to prob
-                        gt_loss = nn.functional.binary_cross_entropy_with_logits(
-                            student_out, gt_mask)
+                        distill_loss = nn.functional.mse_loss(student_out, teacher_out.detach())
+                        gt_loss = nn.functional.binary_cross_entropy_with_logits(student_out, gt_mask)
 
                     else:
                         # Teacher: our UNet WITHOUT GRU (raw logits, no sigmoid)
+                        # Для сравнения с выводом оригинальной модели
                         with torch.no_grad():
                             teacher_out = model.forward_without_gru(img_roi)
 
-                        # Student: our UNet WITH GRU (raw logits)
+                        # Student: UNet WITH GRU (raw logits)
                         student_out = model(img_roi)
 
-                        # Both are logits — BCE with logits for both
-                        # Teacher target: apply sigmoid to convert logits → prob
                         teacher_prob = torch.sigmoid(teacher_out.detach())
                         gt_loss = bce_loss(student_out, gt_mask)
                         distill_loss = bce_loss(student_out, teacher_prob)
 
                     # Temporal consistency on the output
-                    tc_loss = temporal_consistency_loss(
-                        student_out, prev_output, weight=1.0)
+                    tc_loss = temporal_consistency_loss(student_out, prev_output, weight=1.0)
 
-                    # Combined loss
+                    # Combined loss for the current frame
                     loss = (args.gt_weight * gt_loss
                             + args.distill_weight * distill_loss
                             + args.tc_weight * tc_loss)
+                            
+                    accumulated_loss = accumulated_loss + loss
+                    chunk_frames += 1
 
-                    # === Truncated BPTT: backprop each frame independently ===
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        trainable_params, max_norm=1.0)
-                    optimizer.step()
+                    # Truncated BPTT: backprop every K frames
+                    if (step_idx + 1) % args.bptt_steps == 0 or (step_idx + 1) == len(dataloader):
+                        # Average loss over the chunk to keep gradient scale consistent
+                        chunk_loss = accumulated_loss / chunk_frames
+                        chunk_loss.backward()
 
-                    # Detach hidden state to prevent graph accumulation
-                    if args.mode == 'post_unet':
-                        refiner.detach_hidden_state()
-                    else:
-                        model.detach_temporal_state()
+                        # Ограничиваем значения весов, чтобы не возникло взрывающегося градиента
+                        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
 
+                        # Detach hidden state to prevent graph accumulation across chunks
+                        if args.mode == 'post_unet':
+                            refiner.detach_hidden_state()
+                        else:
+                            model.detach_temporal_state()
+                            
+                        epoch_losses.append(chunk_loss.item())
+                        
+                        # Reset accumulators for the next chunk
+                        accumulated_loss = 0
+                        chunk_frames = 0
+
+                    # Keep prev_output detached so TC loss doesn't backprop into the previous frame 
+                    # if it crosses a chunk boundary
                     prev_output = student_out.detach()
-                    epoch_losses.append(loss.item())
 
         scheduler.step()
         mean_loss = sum(epoch_losses) / max(len(epoch_losses), 1)

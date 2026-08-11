@@ -1,5 +1,6 @@
-import math 
+import math
 import time
+import logging
 
 import cv2
 import numpy as np
@@ -11,6 +12,13 @@ from collections import OrderedDict
 
 import torch.nn.functional as F
 from torchvision.ops import boxes
+
+
+# Module-level logger for adaptive-windowing diagnostics.
+# Silent by default (NullHandler). inference.py attaches a FileHandler so
+# the messages land in a log file instead of the console.
+_aw_log = logging.getLogger('adaptive_windowing')
+_aw_log.addHandler(logging.NullHandler())
 
 
 
@@ -314,3 +322,179 @@ def filter_detection_windows_sorted(rois, crop_windows, full_windows, img_shape,
     final_crop_windows = filter_detection_windows_naive(rois, crop_windows, full_windows, img_shape, det_shape=det_shape, allow_resize=allow_resize)
 
     return final_crop_windows 
+    
+    
+def get_object_centric_windows(tracked_objects, img_shape, det_shape,
+                               tiny_threshold=0.01, min_window_ratio=0.5,
+                               padding_factor=2.0, return_sources=False,
+                               verbose=False):
+    """Generate tight detection windows centered on individual tracked tiny objects.
+
+    For each tracked object smaller than `tiny_threshold` (relative to image area),
+    creates a detection window tightly centered on the object. The window size is
+    proportional to the object size (with padding), but at least `min_window_ratio`
+    of the standard detection window. This gives the detector more pixels per
+    tiny object compared to large ROI-blob-based windows.
+
+    Args:
+        tracked_objects (np.ndarray): (N, 4+) array of tracked bounding boxes
+            [x1, y1, x2, y2, ...] in original image coordinates.
+        img_shape (tuple): (H, W) of the original image.
+        det_shape (tuple): (H_det, W_det) standard detector input size.
+        tiny_threshold (float): Relative size threshold. Objects with area /
+            image_area < threshold get object-centric windows. Default: 0.01.
+        min_window_ratio (float): Minimum window size as fraction of det_shape.
+            0.5 means the smallest window is 256×256 for a 512×512 detector.
+            Default: 0.5.
+        padding_factor (float): How much larger the window is relative to the
+            object. 2.0 means the window is 2× the object size in each dim.
+            Default: 2.0.
+        return_sources (bool): If True, also returns the index of the source
+            tracked object for each surviving window.
+        verbose (bool): If True, prints per-object reasoning.
+
+    Returns:
+        np.ndarray: (M, 4) array of object-centric detection windows.
+        np.ndarray (optional): (M,) source indices into tracked_objects.
+    """
+    if tracked_objects is None or len(tracked_objects) == 0:
+        if return_sources:
+            return np.empty((0, 4), dtype=np.int32), np.empty((0,), dtype=np.int32)
+        return np.empty((0, 4), dtype=np.int32)
+
+    img_h, img_w = img_shape
+    img_area = img_h * img_w
+    det_h, det_w = det_shape
+
+    # Minimum window dimensions
+    min_h = int(det_h * min_window_ratio)
+    min_w = int(det_w * min_window_ratio)
+
+    windows = []
+    sources = []
+    for idx, obj in enumerate(tracked_objects):
+        x1, y1, x2, y2 = obj[:4]
+        obj_w = max(1, x2 - x1)
+        obj_h = max(1, y2 - y1)
+        obj_area = obj_w * obj_h
+        relative_size = obj_area / img_area
+
+        # Only create object-centric windows for tiny objects
+        if relative_size >= tiny_threshold:
+            if verbose:
+                _aw_log.info(f"  [OC] obj[{idx}] area={int(obj_area)} rel={relative_size:.5f} "
+                             f">= {tiny_threshold} → SKIP (not tiny)")
+            continue
+
+        # Window size: padded object size, but at least min_window
+        win_w = max(int(obj_w * padding_factor), min_w)
+        win_h = max(int(obj_h * padding_factor), min_h)
+
+        # Maintain detector aspect ratio
+        det_ar = det_h / det_w
+        if win_h / win_w > det_ar:
+            win_w = int(win_h / det_ar)
+        else:
+            win_h = int(win_w * det_ar)
+
+        # Don't create windows larger than the standard detector input
+        # (those are already handled well by the standard pipeline)
+        if win_w >= det_w and win_h >= det_h:
+            if verbose:
+                _aw_log.info(f"  [OC] obj[{idx}] would yield {win_w}x{win_h} >= det "
+                             f"{det_w}x{det_h} → SKIP (covered by standard pipeline)")
+            continue
+
+        # Center window on object
+        xc = (x1 + x2) / 2
+        yc = (y1 + y2) / 2
+
+        wx1 = max(0, int(xc - win_w / 2))
+        wy1 = max(0, int(yc - win_h / 2))
+        wx2 = wx1 + win_w
+        wy2 = wy1 + win_h
+
+        # Clamp to image boundaries
+        if wx2 > img_w:
+            wx2 = img_w
+            wx1 = max(0, wx2 - win_w)
+        if wy2 > img_h:
+            wy2 = img_h
+            wy1 = max(0, wy2 - win_h)
+
+        if verbose:
+            _aw_log.info(f"  [OC] obj[{idx}] obj=({int(x1)},{int(y1)},{int(x2)},{int(y2)}) "
+                         f"→ window=({wx1},{wy1},{wx2},{wy2}) size={win_w}x{win_h}")
+
+        windows.append([wx1, wy1, wx2, wy2])
+        sources.append(idx)
+
+    if not windows:
+        if return_sources:
+            return np.empty((0, 4), dtype=np.int32), np.empty((0,), dtype=np.int32)
+        return np.empty((0, 4), dtype=np.int32)
+
+    windows = np.array(windows, dtype=np.int32)
+    sources = np.array(sources, dtype=np.int32)
+
+    # Deduplicate: remove windows with high IoU (>0.7) with each other
+    # Keep the smaller window (tighter crop = better resolution)
+    if len(windows) > 1:
+        keep = _nms_keep_smaller(windows, iou_threshold=0.7)
+        if verbose and len(keep) < len(windows):
+            dropped = set(range(len(windows))) - set(keep)
+            for d in dropped:
+                _aw_log.info(f"  [OC] window from src obj[{int(sources[d])}] "
+                             f"SUPPRESSED by NMS (overlap with smaller OC window)")
+        windows = windows[keep]
+        sources = sources[keep]
+
+    if return_sources:
+        return windows, sources
+    return windows
+
+
+def _nms_keep_smaller(windows, iou_threshold=0.7):
+    """NMS variant that keeps smaller windows (tighter crops) over larger ones.
+
+    Args:
+        windows (np.ndarray): (N, 4) array of windows [x1, y1, x2, y2].
+        iou_threshold (float): IoU threshold for suppression.
+
+    Returns:
+        list: Indices of windows to keep.
+    """
+    if len(windows) == 0:
+        return []
+
+    areas = (windows[:, 2] - windows[:, 0]) * (windows[:, 3] - windows[:, 1])
+    # Sort by area ascending (smallest first — we prefer tighter crops).
+    # Stable sort: for equal-area windows we keep the input ordering deterministic.
+    order = np.argsort(areas, kind='stable')
+
+    keep = []
+    suppressed = set()
+
+    for idx in order:
+        if idx in suppressed:
+            continue
+        keep.append(idx)
+
+        # Suppress larger windows that overlap significantly
+        for other_idx in order:
+            if other_idx in suppressed or other_idx == idx:
+                continue
+
+            # Compute IoU
+            xx1 = max(windows[idx, 0], windows[other_idx, 0])
+            yy1 = max(windows[idx, 1], windows[other_idx, 1])
+            xx2 = min(windows[idx, 2], windows[other_idx, 2])
+            yy2 = min(windows[idx, 3], windows[other_idx, 3])
+
+            inter = max(0, xx2 - xx1) * max(0, yy2 - yy1)
+            union = areas[idx] + areas[other_idx] - inter
+
+            if union > 0 and inter / union > iou_threshold:
+                suppressed.add(other_idx)
+
+    return keep

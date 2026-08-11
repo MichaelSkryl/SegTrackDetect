@@ -46,10 +46,30 @@ Usage:
             "DC": DroneCrowd,
             "CUSTOM": CustomModel,
         }
-"""
+"""        
+AirportYolov7 = dict(
+    weights = "weights/yolov7t_airport_best.torchscript.pt",
+    in_size = (512,512),
+    preprocess = yolo_preprocess,
+    preprocess_args = dict(),
+    postprocess = yolo_postprocess,
+    postprocess_args = dict(
+        conf_thresh = 0.01,
+        iou_thresh = 0.65,
+        multi_label = True,
+        labels = [],
+        merge = True,
+        agnostic = False,
+    ),
+    classes = ['person', 'airplane', 'vehicle'],
+    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)],
+)
+
+
 DETECTION_MODELS = {
     "MTSD": MTSD,
     "ZeF20": ZeF20,
     "SDS": SeaDronesSee,
     "DC": DroneCrowd,
+    'AirportYolov7': AirportYolov7,
 }

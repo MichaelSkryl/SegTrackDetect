@@ -1,5 +1,6 @@
 from .unet import *
 from .u2net import *
+from .common import estimator_preprocess
 
 
 """
@@ -53,6 +54,15 @@ Usage:
             "CUSTOM": CustomModel,
         }
 """
+Airport_tiny_baseline_batch_8= dict(
+    weights = 'weights/airport_baseline_batch_8/full_model_best.torchscript.pt',
+    in_size = (448, 768),
+    preprocess = estimator_preprocess,
+    preprocess_args = dict(h = 448, w = 768,),
+    postprocess = unet_postprocess,
+    postprocess_args = dict(thresh = 0.5, sigmoid_included = False, dilate = True, k_size = 5,)
+)
+
 ESTIMATOR_MODELS = {
     "MTSD": MTSD,
     "ZeF20": ZeF20,
@@ -63,4 +73,5 @@ ESTIMATOR_MODELS = {
     "DC_tiny": DroneCrowd_tiny,
     "DC_small": DroneCrowd_small,
     "DC_medium": DroneCrowd_medium,
+    "Airport_tiny_batch_8": Airport_tiny_baseline_batch_8,
 }

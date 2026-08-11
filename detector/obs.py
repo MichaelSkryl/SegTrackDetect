@@ -10,7 +10,7 @@ def box_iou(box1, box2):
         box2 (Tensor[M, 4]): Second set of boxes in (x1, y1, x2, y2) format.
 
     Returns:
-        Tensor[N, M]: NxM matrix containing the pairwise IoU values for every 
+        Tensor[N, M]: NxM matrix containing the pairwise IoU values for every
         element in boxes1 and boxes2.
     """
 
@@ -28,30 +28,37 @@ def box_iou(box1, box2):
     area1 = box_area(box1.T)
     area2 = box_area(box2.T)
 
-    inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - 
+    inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) -
              torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
 
-    return inter / (area1[:, None] + area2 - inter) 
-
-    
+    return inter / (area1[:, None] + area2 - inter)
 
 
-def overlapping_box_suppression(windows, bboxes, th=0.6):
+
+
+def overlapping_box_suppression(windows, bboxes, th=0.6, return_mask=False):
     """Perform overlapping box suppression to remove redundant bounding boxes.
 
-    This function removes redundant bounding boxes based on their Intersection over Union (IoU) 
-    with the given thresholds. 
+    This function removes redundant bounding boxes based on their Intersection over Union (IoU)
+    with the given thresholds.
 
     Args:
-        windows (torch.Tensor): A tensor of shape [N, 4] representing the bounding boxes to filter, 
+        windows (torch.Tensor): A tensor of shape [N, 4] representing the bounding boxes to filter,
             where each box is defined by (xmin, ymin, xmax, ymax).
-        bboxes (torch.Tensor): A tensor of shape [M, 5] representing the bounding boxes with confidence scores, 
+        bboxes (torch.Tensor): A tensor of shape [M, 5] representing the bounding boxes with confidence scores,
             where each box is defined by (xmin, ymin, xmax, ymax, confidence).
         th (float): IoU threshold for determining whether to suppress a box. Default is 0.6.
+        return_mask (bool): If True, also returns a boolean mask `del_mask` of shape (M,) where
+            True means the corresponding input bbox was deleted. This lets a caller keep
+            auxiliary per-detection metadata (for example, which window produced each
+            detection) in sync with the filtered output. Default is False, which preserves
+            the original single-value return signature.
 
     Returns:
-        bboxes_filtered (torch.Tensor): The filtered bounding boxes tensor with shape [M', 5], 
+        bboxes_filtered (torch.Tensor): The filtered bounding boxes tensor with shape [M', 5],
             where M' is the number of bounding boxes that are not suppressed.
+        del_mask (torch.Tensor, optional): Boolean mask of shape (M,). Returned only when
+            return_mask=True.
     """
 
     def normalize(input_tensor):
@@ -69,6 +76,8 @@ def overlapping_box_suppression(windows, bboxes, th=0.6):
 
 
     if len(bboxes) == 0:
+        if return_mask:
+            return bboxes, torch.zeros(0, dtype=torch.bool)
         return bboxes
 
 
@@ -81,27 +90,29 @@ def overlapping_box_suppression(windows, bboxes, th=0.6):
 
     # Set intersections with no common area to 0
     intersections[(intersections[:,:,2] - intersections[:,:,0] < 0) | (intersections[:,:,3] - intersections[:,:,1] < 0)] = 0 # no common area
-    
+
     # Set detections from the window to 0
-    window_matches = (windows[:, None] == unique_windows).all(dim=-1) 
+    window_matches = (windows[:, None] == unique_windows).all(dim=-1)
     win_inds = torch.nonzero(window_matches, as_tuple=True)
     intersections[win_inds[0], win_inds[1], :] = 0
-    
+
     # Calculate IoU matrix
     ious = torch.stack([box_iou(intersections[:, i, :], bboxes[:, :4]) for i in range(intersections.shape[1])], dim=1)
-        
+
     # Set diagonal to 0 (a detection cannot be removed because of itself)
     ious.diagonal(dim1=0, dim2=2).zero_()
-    
+
     # Identify to-delete detections
     to_del = torch.nonzero(ious > th)
     ious = ious[ious > th]
     if not ious.numel():
+        if return_mask:
+            return bboxes, torch.zeros(bboxes.shape[0], dtype=torch.bool)
         return bboxes
 
 
     det_ind = to_del[:, 2].to(int)
-    
+
     # Extract confidence scores and areas
     bboxes_det = bboxes[det_ind]
     confs = bboxes_det[:, 4]
@@ -119,7 +130,7 @@ def overlapping_box_suppression(windows, bboxes, th=0.6):
     to_del = torch.hstack((to_del, mean_vals.unsqueeze(-1)))
     to_del = to_del[to_del[:, -1].sort(descending=True)[1]].int() # (N, 4)
 
-    
+
     # Remove detections
     to_del_ids = set()
     del_mask = torch.zeros(bboxes.shape[0], dtype=torch.bool)
@@ -135,4 +146,6 @@ def overlapping_box_suppression(windows, bboxes, th=0.6):
     # Filter bboxes
     bboxes_filtered = bboxes[~del_mask]
 
+    if return_mask:
+        return bboxes_filtered, del_mask
     return bboxes_filtered

@@ -1,0 +1,66 @@
+# =============================================================================
+# Extended SegTrackDetect — docker compose
+#
+#   docker compose build                    # build the image once
+#   docker compose run --rm segtrack        # interactive shell inside it
+#   docker compose run --rm segtrack \
+#       python run.py --source input/clip.mp4 --out_dir output/clip
+#
+# Everything under ./weights, ./input and ./output on the host is visible
+# inside the container at the same relative path.
+# =============================================================================
+services:
+  segtrack:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: segtrackdetect:extended
+    working_dir: /SegTrackDetect
+    stdin_open: true            # keep STDIN open (interactive shell)
+    tty: true
+    ipc: host                   # required by PyTorch DataLoader workers
+    shm_size: "8gb"
+
+    volumes:
+      # Model weights — large, kept outside the image.
+      - ./weights:/SegTrackDetect/weights
+      # Media to process (images / videos).
+      - ./input:/SegTrackDetect/input
+      # Annotated results and JSON.
+      - ./output:/SegTrackDetect/output
+      # COCO-format datasets, only needed for inference.py + metrics.py.
+      - ./data:/SegTrackDetect/data
+      # --- development only -------------------------------------------------
+      # Uncomment to run the host's source instead of the copy baked into the
+      # image, so code edits take effect without rebuilding:
+      # - .:/SegTrackDetect
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Uncomment together with the X11 volume below to use `run.py --show`
+      # on a Linux host: `xhost +local:docker` first.
+      # - DISPLAY=${DISPLAY}
+      # - QT_X11_NO_MITSHM=1
+
+    # volumes for X11 (Linux host, live window via --show)
+    # - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    command: /bin/bash
+
+  # -------------------------------------------------------------------------
+  # CPU-only variant: same image, no GPU reservation. Use when the host has no
+  # NVIDIA driver / nvidia-container-toolkit. Remember to pass --cpu to run.py.
+  # -------------------------------------------------------------------------
+  segtrack-cpu:
+    extends:
+      service: segtrack
+    deploy:
+      resources: {}

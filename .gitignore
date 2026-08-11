@@ -8,3 +8,13 @@
 *.weights
 data
 ablation/*/
+
+# containerised workflow (see README_EXTENDED.md)
+weights/
+input/
+output/
+detections/
+*.mp4
+*.avi
+*.mov
+.claude/

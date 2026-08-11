@@ -1,14 +1,22 @@
+import logging
+
 import cv2
 import numpy as np
 import torch
 
 
 from .estimator import Estimator
-from .estimator.postunet_temporal_estimator import PostUnetTemporalEstimator
+# from .estimator.postunet_temporal_estimator import PostUnetTemporalEstimator
 from .estimator.bottleneck_temporal_estimator import BottleneckTemporalEstimator
 from .predictor import Predictor
 from .windows_proposals import get_roi_bounding_boxes, get_detection_windows, get_object_centric_windows
 from .temporal_heatmap import TemporalDetectionHeatmap
+
+
+# Module-level logger for adaptive-windowing diagnostics. Silent unless
+# inference.py attaches a FileHandler.
+_aw_log = logging.getLogger('adaptive_windowing')
+_aw_log.addHandler(logging.NullHandler())
 
 
 class ROIModule:
@@ -78,6 +86,14 @@ class ROIModule:
         self.aw_padding_factor = aw_padding_factor
         self.aw_max_extra_windows = aw_max_extra_windows
 
+        # Diagnostic state: which OC windows survived this frame and what
+        # tracked bbox each one was generated from. Inference can read these
+        # for visualization. Reset every frame in _merge_adaptive_windows.
+        self.last_oc_windows = np.empty((0, 4), dtype=np.int32)
+        self.last_oc_sources = np.empty((0, 4), dtype=np.int32)
+        # Verbose per-frame OC logging (set True for deep debug).
+        self.aw_verbose = True
+
         # Temporal detection heatmap
         if use_heatmap:
             self.temporal_heatmap = TemporalDetectionHeatmap(
@@ -97,13 +113,13 @@ class ROIModule:
                 gru_weights=temporal_weights,
                 insertion_point=insertion_point,
             )
-        elif use_temporal == 'post_unet':
-            self.estimator = PostUnetTemporalEstimator(
-                estimator_name, device=device,
-                gru_hidden=temporal_hidden,
-                gru_kernel=temporal_ks,
-                gru_weights=temporal_weights,
-            )
+#        elif use_temporal == 'post_unet':
+#            self.estimator = PostUnetTemporalEstimator(
+#                estimator_name, device=device,
+#                gru_hidden=temporal_hidden,
+#                gru_kernel=temporal_ks,
+#                gru_weights=temporal_weights,
+#            )
         else:
             self.estimator = Estimator(estimator_name, device=device)
 
@@ -117,6 +133,8 @@ class ROIModule:
         windows for tiny tracked objects and merges them with standard
         windows.
         """
+        # Cache frame_id so _merge_adaptive_windows can tag its log lines.
+        self._current_frame_id = frame_id
         self.estimated_mask = self.estimator.get_estimated_roi(
             img_tensor, orig_shape
         )
@@ -190,25 +208,62 @@ class ROIModule:
         Returns:
             np.ndarray: Merged detection windows.
         """
+        # Reset diagnostic state for this frame
+        self.last_oc_windows = np.empty((0, 4), dtype=np.int32)
+        self.last_oc_sources = np.empty((0, 4), dtype=np.int32)
+
+        fid = getattr(self, '_current_frame_id', -1)
+        prefix = f"[AW][f{fid}]"
+
         # Use tracker's predicted bounding boxes as object locations
         if self.predictor is None:
             return standard_windows
 
         tracked = self.predictor.predicted_bboxes
         if tracked is None or len(tracked) == 0:
+            if self.aw_verbose:
+                _aw_log.info(f"{prefix} no tracked predictions this frame → no OC windows")
             return standard_windows
 
         tracked_bboxes = np.array(tracked)[:, :4]  # (N, 4) x1,y1,x2,y2
+        areas = ((tracked_bboxes[:, 2] - tracked_bboxes[:, 0]) *
+                 (tracked_bboxes[:, 3] - tracked_bboxes[:, 1]))
+        sort_idx = np.argsort(areas, kind='stable')        # ascending: smallest first
+        tracked_bboxes = tracked_bboxes[sort_idx]
+        areas_sorted = areas[sort_idx]
 
-        # Generate object-centric windows for tiny objects
-        oc_windows = get_object_centric_windows(
+        img_h, img_w = orig_shape
+        img_area = img_h * img_w
+
+        if self.aw_verbose:
+            _aw_log.info(f"{prefix} {len(tracked_bboxes)} tracked obj(s), "
+                         f"tiny_threshold={self.aw_tiny_threshold} "
+                         f"(area<{int(self.aw_tiny_threshold * img_area)} px²), "
+                         f"img={img_w}x{img_h}, det={det_shape[1]}x{det_shape[0]}")
+            for i, (b, a) in enumerate(zip(tracked_bboxes, areas_sorted)):
+                rel = a / img_area
+                tag = "tiny" if rel < self.aw_tiny_threshold else "BIG (will be skipped)"
+                cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+                _aw_log.info(f"  [{i}] bbox=({int(b[0])},{int(b[1])},{int(b[2])},{int(b[3])}) "
+                             f"size={int(b[2]-b[0])}x{int(b[3]-b[1])} area={int(a)} "
+                             f"rel={rel:.5f} center=({int(cx)},{int(cy)}) → {tag}")
+
+        # Generate object-centric windows for tiny objects.
+        # Now also returns the index of the source object in tracked_bboxes.
+        oc_windows, oc_src_idx = get_object_centric_windows(
             tracked_bboxes,
             img_shape=orig_shape,
             det_shape=det_shape,
             tiny_threshold=self.aw_tiny_threshold,
             min_window_ratio=self.aw_min_window_ratio,
             padding_factor=self.aw_padding_factor,
+            return_sources=True,
+            verbose=self.aw_verbose,
         )
+
+        if self.aw_verbose:
+            _aw_log.info(f"{prefix}   {len(oc_windows)} OC candidate window(s) "
+                         f"after generation+NMS")
 
         if len(oc_windows) == 0:
             return standard_windows
@@ -216,22 +271,45 @@ class ROIModule:
         # Filter: remove object-centric windows that are already well-covered
         # by standard windows (if >70% of the oc_window area is inside a
         # standard window, the standard window already covers it)
-        novel_windows = []
-        for oc_win in oc_windows:
-            if not self._is_well_covered(oc_win, standard_windows, coverage_threshold=0.7):
-                novel_windows.append(oc_win)
+        novel = []
+        novel_src = []
+        for w, s in zip(oc_windows, oc_src_idx):
+            if not self._is_well_covered(w, standard_windows, coverage_threshold=0.7):
+                novel.append(w)
+                novel_src.append(tracked_bboxes[s])
+            elif self.aw_verbose:
+                src_box = tracked_bboxes[s]
+                _aw_log.info(f"{prefix}   OC window for src=({int(src_box[0])},{int(src_box[1])},"
+                             f"{int(src_box[2])},{int(src_box[3])}) "
+                             f"DROPPED (well-covered by a similarly-sized standard window)")
 
-        if not novel_windows:
+        if not novel:
+            if self.aw_verbose:
+                _aw_log.info(f"{prefix}   all OC windows redundant → no extras added")
             return standard_windows
 
         # Cap the number of extra windows to control FPS impact
-        novel_windows = novel_windows[:self.aw_max_extra_windows]
-        novel_windows = np.array(novel_windows, dtype=np.int32)
+        novel = novel[:self.aw_max_extra_windows]
+        novel_src = novel_src[:self.aw_max_extra_windows]
+        novel_arr = np.array(novel, dtype=np.int32)
+        novel_src_arr = np.array(novel_src, dtype=np.int32)
+
+        # Expose to caller (inference.py) for visualization
+        self.last_oc_windows = novel_arr
+        self.last_oc_sources = novel_src_arr
+
+        if self.aw_verbose:
+            _aw_log.info(f"{prefix}   {len(novel_arr)} OC window(s) ADDED. Sources:")
+            for w, s in zip(novel_arr, novel_src_arr):
+                wcx, wcy = (w[0]+w[2])//2, (w[1]+w[3])//2
+                scx, scy = (s[0]+s[2])//2, (s[1]+s[3])//2
+                _aw_log.info(f"        win=({w[0]},{w[1]},{w[2]},{w[3]}) center=({wcx},{wcy}) "
+                             f"← src=({s[0]},{s[1]},{s[2]},{s[3]}) center=({scx},{scy})")
 
         # Merge
         if len(standard_windows) == 0:
-            return novel_windows
-        return np.concatenate([standard_windows, novel_windows], axis=0)
+            return novel_arr
+        return np.concatenate([standard_windows, novel_arr], axis=0)
 
 
     @staticmethod

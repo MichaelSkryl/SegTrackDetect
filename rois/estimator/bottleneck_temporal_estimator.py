@@ -46,29 +46,45 @@ class BottleneckTemporalEstimator:
         self.config = ESTIMATOR_MODELS[model_name]
         self.device = device
 
+        # --- Auto-detect perturbation type from the saved checkpoint ---
+        perturbation_type = 'gru'  # default for backward compatibility
+        peek_state = None
+        if gru_weights is not None and os.path.isfile(gru_weights):
+            peek_state = torch.load(gru_weights, map_location='cpu')
+            if isinstance(peek_state, dict):
+                keys = list(peek_state.keys())
+                if any('bottleneck_gru.input_proj' in k for k in keys):
+                    perturbation_type = 'gru'
+                elif any('bottleneck_gru.gru.input_proj' in k for k in keys):
+                    perturbation_type = 'frozen_gru'
+                else:
+                    # Only bottleneck_gru.alpha exists → gaussian / dropout / identity.
+                    # All three are identity at inference, so 'identity' works for all.
+                    perturbation_type = 'identity'
+                print(f"Auto-detected perturbation type: {perturbation_type}")
+        
         # Build the full model with configurable insertion point
         self.net = TemporalUnet(
             gru_hidden=gru_hidden,
             gru_kernel=gru_kernel,
             insertion_point=insertion_point,
-        )
-
-        # Determine weight loading strategy
+            perturbation_type=perturbation_type,)
+        
+        # --- Existing weight-loading logic, but with strict=False for safety ---
         is_full_model = False
-        if gru_weights is not None and os.path.isfile(gru_weights):
-            state = torch.load(gru_weights, map_location='cpu')
-
-            # Auto-detect: full model has encoder/decoder keys,
-            # GRU-only has just bottleneck_gru keys
-            has_encoder = any(k.startswith('encoder.') for k in state.keys())
-            has_decoder = any(k.startswith('decoder.') for k in state.keys())
+        if peek_state is not None and isinstance(peek_state, dict):
+            has_encoder = any(k.startswith('encoder.') for k in peek_state.keys())
+            has_decoder = any(k.startswith('decoder.') for k in peek_state.keys())
             is_full_model = has_encoder and has_decoder
 
         if is_full_model:
-            # Phase 2 full model: load everything directly, skip TorchScript
             print(f"Loading full model weights (Phase 2): "
                   f"{os.path.basename(gru_weights)}")
-            self.net.load_state_dict(state)
+            missing, unexpected = self.net.load_state_dict(peek_state, strict=False)
+            if missing:
+                print(f"  Missing keys (OK if expected for this perturbation type): {len(missing)}")
+            if unexpected:
+                print(f"  Unexpected keys: {len(unexpected)}")
         else:
             # Phase 1 or no GRU weights: load UNet from TorchScript first
             torchscript_path = self.config['weights']
@@ -89,6 +105,9 @@ class BottleneckTemporalEstimator:
                     self.net.bottleneck_gru.load_state_dict(state)
 
         self.net.to(device)
+        if perturbation_type == 'gru':
+            print(f"  GRU output_proj.weight max: {self.net.bottleneck_gru.output_proj.weight.abs().max().item():.6f}")
+            print(f"  GRU alpha gate: {torch.sigmoid(self.net.bottleneck_gru.alpha).item():.6f}")
         self.net.eval()
 
         # Detect dtype from encoder parameters

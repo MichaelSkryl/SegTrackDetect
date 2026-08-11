@@ -1,0 +1,27 @@
+# Keep the image small and the build cache useful.
+# Weights, datasets and results are mounted at run time instead.
+
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+**/.ipynb_checkpoints
+
+weights/
+data/
+data1/
+input/
+output/
+detections/
+ablation/
+
+# The SORT tracker is cloned during the build; never copy a host copy over it.
+rois/predictor/SORT/
+
+*.pt
+*.pth
+*.torchscript.pt
+*.weights
+*.mp4
+*.avi
+*.mov

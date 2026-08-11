@@ -114,8 +114,8 @@ class TemporalROIRefiner(nn.Module):
         self.output_proj = nn.Conv2d(hidden_channels, 1, kernel_size=1, bias=True)
 
         # Learnable residual blending gate
-        # Initialize to -5.0 so sigmoid(-5) ≈ 0.007 — near-identity at start
-        self.alpha = nn.Parameter(torch.tensor(-5.0))
+        # Initialize to -3.0 so sigmoid(-3)
+        self.alpha = nn.Parameter(torch.tensor(-3.0))
 
         # Hidden state (not a parameter — managed manually)
         self._hidden_state = None

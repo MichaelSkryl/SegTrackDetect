@@ -345,10 +345,51 @@ This is the original workflow, used to reproduce the published numbers. It needs
 a COCO-annotated dataset and gives you accuracy metrics; `run.py` needs neither
 and gives you pictures.
 
-Four steps: lay the dataset out, make the container see it, make the annotation
-paths resolve, then run.
+### Step 1 — Get the dataset
 
-### Step 1 — Dataset layout
+The conversion tooling from the original project is unchanged and still works.
+Which path you take depends on the data.
+
+#### Option A — one of the four public datasets
+
+SeaDronesSee, DroneCrowd and 3DZeF20 (ZebraFish) each download, extract and
+convert with a single command. Run it **inside the container** — the scripts
+write to hard-coded `/SegTrackDetect/data/...` paths, which is exactly where
+your `data/` directory is mounted:
+
+```bash
+docker compose run --rm segtrack bash scripts/download_SeaDronesSee.sh
+```
+
+Substitute `download_DroneCrowd.sh` or `download_3DZeF20.sh` as needed. Each
+script ends by calling its converter in `scripts/converters/`, so when it
+finishes the dataset is already in the layout below, with the annotation paths
+written as absolute container paths. **Steps 2 and 3 do not apply** — everything
+is in the right place.
+
+To fetch all of them in one go:
+
+```bash
+docker compose run --rm segtrack bash scripts/download_and_convert.sh
+```
+
+Three things to know before you do:
+
+* These are large downloads, and the converters **copy** images into the new
+  layout rather than moving them, leaving the originals in place. Budget roughly
+  twice the size of the extracted dataset. Deleting `data/<Name>/images/train`,
+  `/val` and `/test` after conversion reclaims the duplicate.
+* `download_and_convert.sh` runs each converter a second time after the download
+  script has already run it. Harmless, just slow — running the per-dataset
+  scripts individually avoids it.
+* **MTSD is not automatic.** It requires manual registration and download;
+  `scripts/download_MTSD.sh` prints instructions, and its converter is
+  deliberately commented out of `download_and_convert.sh`. Once the files are in
+  place, run `python scripts/converters/MTSD.py` yourself.
+
+#### Option B — your own dataset
+
+Produce this layout by hand:
 
 ```
 data/YourDataset/
@@ -366,7 +407,13 @@ For still images with no temporal order, put the files directly in `images/`
 with no sub-directories. The sequence directories are what make the tracker and
 the temporal modules work, so keep them if your data is video.
 
+The converters in `scripts/converters/` are worth reading as templates if you
+are writing your own — each one takes a dataset's native annotations and emits
+exactly this structure.
+
 ### Step 2 — Make the container see it
+
+*(Option B only — Option A already downloaded into the mounted directory.)*
 
 The `data/` directory in the repository is already mounted into the container at
 `/SegTrackDetect/data`, so in the common case there is nothing to configure:
@@ -400,6 +447,8 @@ worth keeping — nothing in the pipeline writes to the dataset.
 > resolve. Use a bind mount.
 
 ### Step 3 — Make the annotation paths resolve
+
+*(Option B only — the converters already write correct paths.)*
 
 This is the step that catches everyone. `file_name` in the COCO json is used
 directly as a filesystem path, and images whose path does not resolve are
@@ -893,6 +942,19 @@ Each also has a `*_final.pt` twin from the last epoch. Prefer `*_best.pt`.
 through bash rather than directly — `bash scripts/download_models.sh`, not
 `./scripts/download_models.sh`. The upstream scripts carry no `#!` line, so
 Docker has no way to know what should execute them.
+
+**`unzip: command not found` during a dataset download.** The image predates the
+fix that adds it. Rebuild:
+
+```bash
+docker compose build
+```
+
+**`Permission denied` from `download_and_convert.sh`.** That script calls the
+per-dataset scripts directly, so they need the executable bit. The image sets it
+during the build, but a dev-mode mount (`- .:/SegTrackDetect` in
+`docker-compose.yml`) replaces them with the host's copies, which git checks out
+without it. Either comment the mount out, or `chmod +x scripts/*.sh` on the host.
 
 **`$'\r': command not found`, or a directory literally named `weights?`.** The
 scripts were checked out on Windows with CRLF line endings and copied into the

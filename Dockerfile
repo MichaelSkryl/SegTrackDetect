@@ -24,8 +24,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # libgl1-mesa-glx + libglib2.0-0 : OpenCV runtime
 # ffmpeg + libsm6 + libxext6      : video decode/encode for run.py
 # libxrender1                     : needed when using cv2.imshow via X11
+# unzip: every scripts/download_*.sh extracts a .zip. The upstream image
+# installs only `zip`, which does not provide it, so the dataset downloads
+# failed at the extraction step.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git gcc g++ wget zip htop screen \
+        git gcc g++ wget zip unzip htop screen \
         libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender1 \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/*

@@ -30,6 +30,16 @@ services:
       - ./output:/SegTrackDetect/output
       # COCO-format datasets, only needed for inference.py + metrics.py.
       - ./data:/SegTrackDetect/data
+      # inference.py results — this is its default --out_dir, so without this
+      # mount every dataset run would be written inside the container and lost
+      # when it exits.
+      - ./detections:/SegTrackDetect/detections
+      # --- extra datasets ----------------------------------------------------
+      # A dataset too large to sit inside the repo can be bind-mounted directly.
+      # Mount it UNDER /SegTrackDetect/data so the paths in its COCO json still
+      # resolve. A symlink in ./data will NOT work — the container cannot follow
+      # a link that points outside the mounted tree.
+      # - /mnt/storage/MyDataset:/SegTrackDetect/data/MyDataset:ro
       # --- development only -------------------------------------------------
       # Uncomment to run the host's source instead of the copy baked into the
       # image, so code edits take effect without rebuilding:

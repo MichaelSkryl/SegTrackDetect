@@ -76,6 +76,7 @@ RUN find /SegTrackDetect/scripts -type f -name '*.sh' -print0 \
 RUN mkdir -p /SegTrackDetect/weights \
              /SegTrackDetect/data \
              /SegTrackDetect/input \
-             /SegTrackDetect/output
+             /SegTrackDetect/output \
+             /SegTrackDetect/detections
 
 CMD ["/bin/bash"]

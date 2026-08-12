@@ -69,19 +69,23 @@ cd SegTrackDetect
 
 ### Step 3 — Create the working directories
 
-These four are mounted into the container; everything you put in them is
+These five are mounted into the container; everything you put in them is
 visible inside, and everything the container writes appears on your machine.
 
 ```bash
-mkdir -p weights input output data
+mkdir -p weights input output data detections
 ```
 
 | Directory | Holds |
 |---|---|
 | `weights/` | model files (`.pt`) |
 | `input/` | your photos and videos |
-| `output/` | annotated results |
+| `output/` | annotated results from `run.py` |
 | `data/` | COCO datasets (only for `inference.py` and training) |
+| `detections/` | dataset results from `inference.py` |
+
+Anything written anywhere else inside the container is lost when it exits, so
+keep `--out_dir` pointing into one of these.
 
 ### Step 4 — Build the image
 
@@ -341,7 +345,10 @@ This is the original workflow, used to reproduce the published numbers. It needs
 a COCO-annotated dataset and gives you accuracy metrics; `run.py` needs neither
 and gives you pictures.
 
-### Dataset layout
+Four steps: lay the dataset out, make the container see it, make the annotation
+paths resolve, then run.
+
+### Step 1 — Dataset layout
 
 ```
 data/YourDataset/
@@ -356,32 +363,104 @@ data/YourDataset/
 ```
 
 For still images with no temporal order, put the files directly in `images/`
-with no sub-directories.
+with no sub-directories. The sequence directories are what make the tracker and
+the temporal modules work, so keep them if your data is video.
 
-> **Critical.** The `file_name` entries inside the JSON must be **absolute paths
-> as seen inside the container**, e.g. `/SegTrackDetect/data/YourDataset/images/seq1/000001.jpg`.
-> The loader filters the list with `os.path.isfile()`, so wrong paths do not
-> raise an error — they silently produce an empty dataset, and the next line
-> fails with a confusing `IndexError`. This is the single most common setup
-> mistake.
+### Step 2 — Make the container see it
 
-### Inference
+The `data/` directory in the repository is already mounted into the container at
+`/SegTrackDetect/data`, so in the common case there is nothing to configure:
+
+```bash
+mv ~/Downloads/YourDataset data/
+```
+
+That is all. Anything under `data/` is visible inside the container at the same
+relative path, and `--data_root data/YourDataset` will find it.
+
+**If the dataset is too large to sit inside the repository**, bind-mount it
+instead. Add a line to the `volumes:` block of `docker-compose.yml` — there is a
+commented example there already:
+
+```yaml
+      - /mnt/storage/YourDataset:/SegTrackDetect/data/YourDataset:ro
+```
+
+Or mount it for a single run without editing anything:
+
+```bash
+docker compose run --rm -v /mnt/storage/YourDataset:/SegTrackDetect/data/YourDataset:ro segtrack python inference.py --data_root data/YourDataset --split test
+```
+
+Mount it **under** `/SegTrackDetect/data` either way. The `:ro` is optional but
+worth keeping — nothing in the pipeline writes to the dataset.
+
+> A symlink inside `data/` pointing elsewhere on the host will **not** work. The
+> container sees the link but not its target, so every image silently fails to
+> resolve. Use a bind mount.
+
+### Step 3 — Make the annotation paths resolve
+
+This is the step that catches everyone. `file_name` in the COCO json is used
+directly as a filesystem path, and images whose path does not resolve are
+dropped without an error — an annotation file exported on another machine
+produces an empty dataset and a confusing `IndexError`, not a message about
+paths.
+
+Check and fix in one command:
+
+```bash
+docker compose run --rm segtrack python scripts/fix_coco_paths.py --data_root data/YourDataset --dry_run
+```
+
+It reports, per split, how many entries resolve. If everything is already
+correct it says so and changes nothing. Otherwise drop `--dry_run` to rewrite
+them:
+
+```bash
+docker compose run --rm segtrack python scripts/fix_coco_paths.py --data_root data/YourDataset
+```
+
+Images are matched by sequence directory plus file name, so identically-named
+frames in different sequences are handled correctly. The original file is kept
+as `<split>.json.bak`. Anything that cannot be matched is listed and left alone.
+
+Run it **inside the container**, as above — it writes the paths the container
+will see. Add `--relative` to write paths relative to the repository root
+instead, which survives the repository being moved.
+
+### Step 4 — Run inference
 
 ```bash
 docker compose run --rm segtrack python inference.py --data_root data/YourDataset --split test --roi_model Airport_tiny_batch_8 --det_model AirportYolov7 --tracker sort --bbox_type sorted --allow_resize --use_adaptive_windowing --out_dir detections/my_run
 ```
 
-Writes one text file of detections per sequence into `detections/my_run/`.
+Results land in `detections/my_run/` on the host:
 
-### Metrics
+| File | Contents |
+|---|---|
+| `results-test.json` | the detections, COCO format — this is what `metrics.py` reads |
+| `times.csv` | per-stage timings and overall FPS |
+| `windows_per_frame.json` | how many detection windows each frame produced |
+| `args.json`, `configs.json` | the exact configuration used |
+| `detector_call_stats.json` | detector invocation counts |
+
+> `--out_dir` must **not already exist** — `inference.py` refuses to overwrite a
+> previous run and stops with `FileExistsError`. Use a new directory name each
+> time, which also keeps configurations comparable.
+
+### Step 5 — Compute metrics
 
 ```bash
 docker compose run --rm segtrack python metrics.py --dir detections/my_run --gt_path data/YourDataset/test.json --csv detections/my_run/metrics.csv
 ```
 
 Prints the standard COCO table (AP, AP50, AP75, AP<sub>S/M/L</sub>, AR) and
-appends a row to the CSV, so running several configurations into the same CSV
-gives you a comparison table.
+appends a row to the CSV. Point several runs at the same `--csv` and it becomes
+a comparison table.
+
+`--dir` must contain exactly one `results*.json`, so pass the directory of a
+single run, not a parent holding several.
 
 For DroneCrowd-style data (very dense, very small objects) add `--dc`, which
 switches to `maxDets=500` and `iouThr=0.5`.
@@ -856,8 +935,29 @@ start), or the alpha gate never rose during training. Check the alpha values
 printed at startup and during training.
 
 **`IndexError` immediately after "Found 0 images".** The `file_name` entries in
-your COCO JSON do not resolve. They must be absolute paths as seen **inside the
-container** — `/SegTrackDetect/data/...`, not a host path and not a relative one.
+your COCO json do not resolve inside the container, so every image was filtered
+out. Diagnose and fix in one command:
+
+```bash
+docker compose run --rm segtrack python scripts/fix_coco_paths.py --data_root data/YourDataset --dry_run
+```
+
+**"Found 0 images" and the dataset is bind-mounted.** Check it is mounted *under*
+`/SegTrackDetect/data`, and that you used a bind mount rather than a symlink in
+`data/` — the container cannot follow a link whose target is not mounted.
+`docker compose config` prints the mounts as Docker will apply them.
+
+**`FileExistsError` from `inference.py`.** `--out_dir` already exists; the script
+will not overwrite a previous run. Pick a new directory name.
+
+**Results are missing after `inference.py` finished successfully.** `--out_dir`
+pointed somewhere that is not mounted, so they were written inside the container
+and discarded when it exited. Only `weights/`, `input/`, `output/`, `data/` and
+`detections/` survive.
+
+**`AssertionError` from `metrics.py`.** `--dir` must hold exactly one
+`results*.json`. Point it at one run's directory, not a parent containing
+several.
 
 **`Could not open video writer`.** ffmpeg missing — rebuild with
 `docker compose build --no-cache`.

@@ -264,13 +264,10 @@ behaviour, which would otherwise look like a successful run.
 
 There are two ways to obtain weights:
 
-**Option 1 — use the released checkpoint.** Trained on SeaDronesSee, suitable
+**Option 1 — use the ConvGRU trained on SDS.** Trained on SeaDronesSee, suitable
 for aerial and water scenes with very small objects.
 
-<!-- TODO: replace with the release URL once the weights are uploaded -->
-```bash
-wget -nv <RELEASE_URL>/sds_convgru_phase2.pt -O weights/sds_convgru/full_model_best.pt
-```
+Place the .pt file inside the weights folder.
 
 | Property | Value |
 |---|---|

@@ -213,10 +213,6 @@ def train():
     parser.add_argument('--alpha_init', type=float, default=-3.0, help='Alpha initialization (Controls the GRU output to the original features')
     # Reproducibility
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
-    
-    parser.add_argument('--val_split', type=str, default='val', help='Validation split name (looks for data_root/val_split.json).')
-    parser.add_argument('--val_every', type=int, default=1, help='Run validation every N epochs.')
-    parser.add_argument('--select_by', type=str, default='val_loss', choices=['train_loss', 'val_loss'], help='Metric for best-checkpoint selection.')
 
     args = parser.parse_args()
     
@@ -362,20 +358,6 @@ def train():
     roi_transform = estimator_preprocess(**config['preprocess_args'])
 
     ds = DirectoryDataset(data_root=args.data_root, split=args.split)
-    
-    val_ds = None
-    val_anno_index = None
-    if args.select_by == 'val_loss':
-        try:
-            val_ds = DirectoryDataset(data_root=args.data_root, split=args.val_split)
-            val_anno_index = build_annotation_index(val_ds)
-            print(f"  Val dataset loaded: {len(val_ds.images)} images, "
-                  f"{len(val_anno_index)} with annotations")
-        except SystemExit:
-            print(f"  WARNING: val split '{args.val_split}' not found. "
-                  f"Falling back to train_loss selection.")
-            args.select_by = 'train_loss'
-            val_ds = None
 
     # Build annotation index for GT supervision
     anno_index = build_annotation_index(ds)
@@ -634,16 +616,8 @@ def train():
             alpha_val = torch.sigmoid(model.bottleneck_gru.alpha).item()
             print(f"  Alpha gate: {alpha_val:.4f} (sigmoid of {model.bottleneck_gru.alpha.item():.3f})")
 
-        val_loss = None
-        if val_ds is not None and ((epoch + 1) % args.val_every == 0):
-            val_loss = evaluate_val_loss(model, val_ds, config, roi_transform,
-                                         val_anno_index, bce_loss, device)
-            print(f"  Val loss: {val_loss:.6f}")
-
-        # Decide which metric drives "best"
-        selection_metric = val_loss if (args.select_by == 'val_loss' and val_loss is not None) else mean_loss
-        if selection_metric < best_loss:
-            best_loss = selection_metric
+        if mean_loss < best_loss:
+            best_loss = mean_loss
             if args.mode == 'post_unet':
                 save_path = os.path.join(args.out_dir, 'temporal_refiner_best.pt')
                 torch.save(refiner.state_dict(), save_path)
@@ -651,14 +625,15 @@ def train():
                 save_path = os.path.join(args.out_dir, 'bottleneck_gru_best.pt')
                 torch.save(model.bottleneck_gru.state_dict(), save_path)
             else:
+                # Baseline or Phase 2: the whole network is trainable
                 save_path = os.path.join(args.out_dir, 'full_model_best.pt')
                 torch.save(model.state_dict(), save_path)
-            print(f"  → Saved best ({args.select_by}={best_loss:.6f}): {save_path}")
+            print(f"  → Saved best: {save_path} (loss: {best_loss:.6f})")
     # Save final
     if args.mode == 'post_unet':
         save_path = os.path.join(args.out_dir, 'temporal_refiner_final.pt')
         torch.save(refiner.state_dict(), save_path)
-    elif args.phase == 1 and args.mode != 'baseline':  # <--- AND HERE
+    elif args.phase == 1 and args.mode != 'baseline':
         save_path = os.path.join(args.out_dir, 'bottleneck_gru_final.pt')
         torch.save(model.bottleneck_gru.state_dict(), save_path)
     else:

@@ -1,0 +1,21 @@
+# Shell scripts must keep LF endings even when checked out on Windows.
+# Without this, a clone with core.autocrlf=true rewrites them with CRLF, the
+# Docker build copies them into the image, and every script fails inside the
+# container with `$'\r': command not found`.
+*.sh text eol=lf
+
+# Same reasoning for files consumed by the Linux container.
+Dockerfile   text eol=lf
+*.dockerfile text eol=lf
+docker-compose.yml text eol=lf
+
+# Python is tolerant of CRLF, but keeping it uniform avoids noisy diffs
+# between contributors on different platforms.
+*.py text eol=lf
+
+# Never touch binary payloads.
+*.pt   binary
+*.pth  binary
+*.jpg  binary
+*.png  binary
+*.mp4  binary

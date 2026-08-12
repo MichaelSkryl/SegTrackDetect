@@ -61,6 +61,17 @@ RUN git clone --depth 1 https://github.com/deepdrivepl/SORT.git \
 # Anything listed in .dockerignore (weights, data, .git, outputs) is skipped.
 COPY . /SegTrackDetect
 
+# --- normalise shell scripts -------------------------------------------------
+# A checkout on Windows with core.autocrlf=true rewrites every .sh file with
+# CRLF line endings, which a Linux shell cannot run: `mkdir -p $OUT_DIR` would
+# create a directory whose name ends in a carriage return, and every command
+# reports `$'\r': command not found`. Strip the CRs and set the executable bit,
+# which git does not preserve on Windows either.
+RUN find /SegTrackDetect/scripts -type f -name '*.sh' -print0 \
+        | xargs -0 -r sed -i 's/\r$//' \
+    && find /SegTrackDetect/scripts -type f -name '*.sh' -print0 \
+        | xargs -0 -r chmod +x
+
 # Mount points for things that stay outside the image
 RUN mkdir -p /SegTrackDetect/weights \
              /SegTrackDetect/data \

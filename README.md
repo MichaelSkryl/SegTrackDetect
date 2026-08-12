@@ -120,8 +120,12 @@ weights/
 To download the public models instead (SeaDronesSee, DroneCrowd, MTSD, ZebraFish):
 
 ```bash
-docker compose run --rm segtrack ./scripts/download_models.sh
+docker compose run --rm segtrack bash scripts/download_models.sh
 ```
+
+Note the `bash` prefix. The upstream scripts have no `#!` line, so Docker cannot
+execute them directly — `./scripts/download_models.sh` fails with `exec format
+error`. The same applies to every script under `scripts/`.
 
 These paths are not guessed by the program — they come from two registry files:
 
@@ -129,8 +133,8 @@ These paths are not guessed by the program — they come from two registry files
 * `rois/estimator/configs/__init__.py` → the `ESTIMATOR_MODELS` dictionary
 
 The `--det_model` and `--roi_model` flags take **keys from those dictionaries**,
-not file paths. Section [Registering a new model](#5-registering-the-result)
-shows how to add your own.
+not file paths. Section [Register the result](#3-register-the-result) shows how
+to add your own.
 
 ### Step 6 — Drop in a test photo
 
@@ -237,59 +241,104 @@ docker compose run --rm segtrack python run.py --source 0 --show --hud --roi_mod
 Press `q` or `Esc` to stop. On Windows and macOS hosts this needs an X server;
 the reliable path there is to drop `--show` and open the saved file.
 
-### Using the temporal ConvGRU
+## Using the temporal ConvGRU
 
-See [Why the ConvGRU is different](#why-the-convgru-needs-more-care) below for
-what it requires. The command:
+The ConvGRU is a recurrent block inside the ROI encoder. On a single frame the
+segmentation mask is produced from that frame alone, so it moves and changes
+shape from one frame to the next even when the object does not. The ConvGRU
+carries a hidden state forward, so each mask is informed by what the previous
+frames showed. The practical effect is a steadier, more compact region of
+interest, which in turn places the detection window more consistently on the
+object.
 
+### It cannot be used without trained weights
+
+Unlike the heatmap and adaptive windowing, this module is a set of learned
+parameters, and it ships **untrained**. It is deliberately initialised close to
+the identity function — the blend gate starts near zero and the output
+projection is zeroed — so that training begins from the baseline behaviour
+rather than from noise. The consequence at inference time is that an untrained
+ConvGRU passes features through almost unchanged and reproduces the baseline
+result exactly.
+
+`--use_temporal bottleneck` on its own therefore does nothing useful. It must
+always be paired with `--temporal_weights`. If the file is missing or the path
+is wrong, `run.py` stops with an error rather than falling back to baseline
+behaviour, which would otherwise look like a successful run.
+
+There are two ways to obtain weights:
+
+**Option 1 — use the released checkpoint.** Trained on SeaDronesSee, suitable
+for aerial and water scenes with very small objects.
+
+<!-- TODO: replace with the release URL once the weights are uploaded -->
 ```bash
-docker compose run --rm segtrack python run.py --source input/drone.mp4 --roi_model SDS_large --det_model SDS --use_temporal bottleneck --temporal_weights weights/my_run_phase2/full_model_best.pt --insertion_point 2 --temporal_hidden 32 --use_heatmap --out_dir output/drone --hud
+wget -nv <RELEASE_URL>/sds_convgru_phase2.pt -O weights/sds_convgru/full_model_best.pt
 ```
 
----
+| Property | Value |
+|---|---|
+| Base ROI model | `SDS_large` |
+| Insertion point | `2` |
+| Hidden channels | `32` |
+| Kernel size | `3` |
+| Training | Phase 1 (30 epochs) + Phase 2 joint fine-tuning (15 epochs) |
 
-## Why the ConvGRU needs more care
+**Option 2 — train your own** on your data, following
+[Path B in Part IV](#path-b--training-the-temporal-convgru). This is the right
+choice if your footage differs substantially from aerial water scenes.
 
-The earlier draft of this document said the ConvGRU is "only for footage from a
-moving camera". That was imprecise, and worth stating properly, because two
-separate things were conflated.
+### Three flags must match the checkpoint
 
-**1. There is no restriction on camera motion.** The ConvGRU runs on any
-sequence — static camera, moving camera, drone, hand-held. What we observed is a
-*result*, not a constraint: on the static airport camera it produced no accuracy
-gain. The reason is that a static camera already yields stable segmentation
-masks from frame to frame, so a module whose job is to stabilise them across
-time has nothing left to correct. On drone footage, where ego-motion makes the
-masks jitter, it does help. So: it is always *allowed*; it is only *worth the
-cost* when the single-frame masks are unstable. Try it on your footage and
-compare — that is the only way to know.
+`--insertion_point`, `--temporal_hidden` and `--temporal_ks` are not tuning
+preferences at inference time — they define the shapes of the tensors being
+loaded. The insertion point selects which encoder layer the block sits after
+(`2` = after `layer1`, 64 channels; `5` = after `layer4`, 512 channels), and the
+hidden size sets the recurrent width. If any of them differs from the values
+used during training, loading fails with `RuntimeError: size mismatch`.
 
-**2. You are right that it needs trained weights.** `--use_temporal bottleneck`
-alone is not enough. The ConvGRU is initialised near-identity on purpose (the
-blend gate `alpha` starts at sigmoid(−3) ≈ 0.05 and the output projection is
-zeroed), so an untrained one passes features through almost unchanged and simply
-reproduces the baseline. You must pass `--temporal_weights` pointing at a
-checkpoint from Part IV. Until this version, a wrong path was skipped silently —
-`run.py` now refuses to start instead.
-
-**3. What "must match the checkpoint" means.** `--insertion_point` and
-`--temporal_hidden` are not preferences; they define tensor shapes. Insertion
-point 2 puts the ConvGRU after `layer1` (64 channels), point 5 after `layer4`
-(512 channels), and the hidden size sets the recurrent width. If either differs
-from the checkpoint, PyTorch raises `RuntimeError: size mismatch` at load time —
-loudly, which is fine. Both values are recorded in `train_args.json`, written
-next to every checkpoint:
+Every checkpoint is accompanied by a `train_args.json` recording exactly what
+was used:
 
 ```bash
-cat weights/my_run_phase2/train_args.json
+cat weights/sds_convgru/train_args.json
 ```
 
-Read `insertion_point` and `gru_hidden` from it.
+Read the three values from it, keeping in mind that the training and inference
+flags have different names:
 
-> **Naming trap.** Training calls the hidden size `--gru_hidden` and defaults it
-> to **64**. Inference calls the same thing `--temporal_hidden` and defaults it
-> to **16**. If you train with the default and infer with the default, loading
-> fails. Always pass the value explicitly at inference.
+| In `train_args.json` | Pass at inference as |
+|---|---|
+| `insertion_point` | `--insertion_point` |
+| `gru_hidden` | `--temporal_hidden` |
+| `gru_kernel` | `--temporal_ks` |
+
+> The defaults differ between training and inference (`--gru_hidden` defaults to
+> 64, `--temporal_hidden` to 16). Always pass these values explicitly rather
+> than relying on defaults.
+
+### When it is worth enabling
+
+The ConvGRU runs on any sequence — static camera, drone, hand-held. Whether it
+improves anything depends on how stable the single-frame masks already are.
+
+On a static camera the masks are typically stable from frame to frame, so a
+module whose purpose is to stabilise them has little to correct; in our
+experiments on static airport footage it produced no measurable gain over the
+baseline. On moving-camera footage, where ego-motion makes the masks jitter, it
+does help. It also costs a few frames per second.
+
+Run your footage both ways and compare before committing to it.
+
+### Command
+
+```bash
+docker compose run --rm segtrack python run.py --source input/drone.mp4 --roi_model SDS_large --det_model SDS --use_temporal bottleneck --temporal_weights weights/sds_convgru/full_model_best.pt --insertion_point 2 --temporal_hidden 32 --use_heatmap --out_dir output/drone --hud
+```
+
+`--roi_model` is still required: it supplies the input resolution and the
+post-processing settings, even though the network weights come from
+`--temporal_weights`. Use the same value the checkpoint was trained with.
 
 ---
 
@@ -371,8 +420,7 @@ Do you want temporal memory in the ROI stage?
 
 ## Preparing the data
 
-Training uses the same layout as Part III, and needs **at least two splits** —
-one to train on and one to validate on:
+Training uses the same layout as Part III:
 
 ```
 data/YourDataset/
@@ -380,6 +428,10 @@ data/YourDataset/
 ├── train.json
 └── val.json
 ```
+
+Only the training split is read during training. Keep a held-out split as well —
+you will need it to evaluate the result with `inference.py` + `metrics.py`, which
+is how you find out whether the training actually helped.
 
 The ground-truth masks are generated automatically from the COCO bounding boxes,
 so no segmentation annotation is required. Sequences matter: the script samples
@@ -395,7 +447,7 @@ Four steps: train, export, register, use.
 ### 1. Train
 
 ```bash
-docker compose run --rm segtrack python train_bottleneck_temporal.py --data_root data/YourDataset --split train --val_split val --roi_model SDS_large --mode baseline --epochs 30 --lr 1e-3 --baseline_batch_size 8 --select_by val_loss --out_dir weights/my_baseline
+docker compose run --rm segtrack python train_bottleneck_temporal.py --data_root data/YourDataset --split train --roi_model SDS_large --mode baseline --epochs 30 --lr 1e-3 --baseline_batch_size 8 --out_dir weights/my_baseline
 ```
 
 `--roi_model` here selects the **starting weights** — training begins from that
@@ -407,7 +459,7 @@ Produces in `weights/my_baseline/`:
 
 | File | What it is |
 |---|---|
-| `full_model_best.pt` | best epoch by validation loss — **use this one** |
+| `full_model_best.pt` | lowest training loss — **use this one** |
 | `full_model_final.pt` | last epoch |
 | `train_args.json` | every argument used, for reproducibility |
 
@@ -415,8 +467,9 @@ Tips:
 
 * `--baseline_batch_size 8` matters. BatchNorm behaves poorly at batch size 1;
   8 was what worked in our experiments.
-* `--select_by val_loss` (the default) picks the checkpoint that generalises,
-  not the one that memorises. It requires `--val_split`.
+* Checkpoint selection is by **training** loss. There is no validation loop, so
+  a falling loss curve is not by itself evidence of a better model — evaluate
+  the exported result on a held-out split with `metrics.py` before trusting it.
 * `--bn_eval` freezes BatchNorm statistics. Worth trying if training is unstable
   or your dataset is small.
 * `--seed 42` is the default; change it to check that a result is not luck.
@@ -480,7 +533,7 @@ protected; Phase 2 then adapts them to each other at a low learning rate.
 ### Phase 1 — ConvGRU only, UNet frozen
 
 ```bash
-docker compose run --rm segtrack python train_bottleneck_temporal.py --data_root data/YourDataset --split train --val_split val --roi_model SDS_large --mode bottleneck --phase 1 --insertion_point 2 --gru_hidden 32 --gru_kernel 3 --alpha_init -3.0 --epochs 30 --lr 1e-3 --seq_len 16 --bptt_steps 4 --out_dir weights/my_gru_phase1
+docker compose run --rm segtrack python train_bottleneck_temporal.py --data_root data/YourDataset --split train --roi_model SDS_large --mode bottleneck --phase 1 --insertion_point 2 --gru_hidden 32 --gru_kernel 3 --alpha_init -3.0 --epochs 30 --lr 1e-3 --seq_len 16 --bptt_steps 4 --out_dir weights/my_gru_phase1
 ```
 
 Produces `weights/my_gru_phase1/bottleneck_gru_best.pt` — the ConvGRU parameters
@@ -517,7 +570,7 @@ learning nothing useful and something upstream is wrong — usually the data.
 ### Phase 2 — joint fine-tuning
 
 ```bash
-docker compose run --rm segtrack python train_bottleneck_temporal.py --data_root data/YourDataset --split train --val_split val --roi_model SDS_large --mode bottleneck --phase 2 --gru_weights weights/my_gru_phase1/bottleneck_gru_best.pt --insertion_point 2 --gru_hidden 32 --epochs 15 --lr 1e-4 --seq_len 16 --bptt_steps 4 --unet_lr_scale 0.01 --out_dir weights/my_gru_phase2
+docker compose run --rm segtrack python train_bottleneck_temporal.py --data_root data/YourDataset --split train --roi_model SDS_large --mode bottleneck --phase 2 --gru_weights weights/my_gru_phase1/bottleneck_gru_best.pt --insertion_point 2 --gru_hidden 32 --epochs 15 --lr 1e-4 --seq_len 16 --bptt_steps 4 --unet_lr_scale 0.01 --out_dir weights/my_gru_phase2
 ```
 
 Produces `weights/my_gru_phase2/full_model_best.pt` — the complete model.
@@ -689,7 +742,6 @@ python train_bottleneck_temporal.py --data_root <dir> --mode <mode> [options]
 |---|---|---|
 | `--data_root` | *required* | Dataset root |
 | `--split` | `train` | Training split |
-| `--val_split` | `val` | Validation split |
 | `--roi_model` | `SDS_tiny` | Starting weights, a key in `ESTIMATOR_MODELS` |
 
 **Mode**
@@ -736,8 +788,10 @@ python train_bottleneck_temporal.py --data_root <dir> --mode <mode> [options]
 | Flag | Default | Meaning |
 |---|---|---|
 | `--out_dir` | `weights/temporal_v4` | Where checkpoints and `train_args.json` go |
-| `--val_every` | `1` | Validate every N epochs |
-| `--select_by` | `val_loss` | `val_loss` or `train_loss` — which metric defines "best" |
+
+The best checkpoint is the epoch with the lowest **training** loss; there is no
+validation loop. Evaluate the result on a held-out split with `inference.py` +
+`metrics.py` before drawing conclusions from it.
 
 **Ablation controls**
 
@@ -762,6 +816,28 @@ Each also has a `*_final.pt` twin from the last epoch. Prefer `*_best.pt`.
 ---
 
 # Part VI — Troubleshooting
+
+**`exec format error` when running a script under `scripts/`.** Invoke it
+through bash rather than directly — `bash scripts/download_models.sh`, not
+`./scripts/download_models.sh`. The upstream scripts carry no `#!` line, so
+Docker has no way to know what should execute them.
+
+**`$'\r': command not found`, or a directory literally named `weights?`.** The
+scripts were checked out on Windows with CRLF line endings and copied into the
+image that way. Rebuilding fixes it — the Dockerfile now strips the carriage
+returns after `COPY`:
+
+```bash
+docker compose build --no-cache
+```
+
+To stop it recurring in the working tree itself, a `.gitattributes` pins `*.sh`
+to LF. It applies to files as they are checked out, so existing files need one
+renormalisation pass:
+
+```bash
+git add --renormalize .
+```
 
 **`cuda False` / everything runs on CPU.** The container did not get the GPU.
 Run the `nvidia-smi` check from Step 1; if that fails, install

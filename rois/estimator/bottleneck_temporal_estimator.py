@@ -95,14 +95,14 @@ class BottleneckTemporalEstimator:
                 print(f"Loading ConvGRU weights (Phase 1): "
                       f"{os.path.basename(gru_weights)}")
 
-                if any('bottleneck_gru' in k for k in state.keys()):
+                if any('bottleneck_gru' in k for k in peek_state.keys()):
                     # Full model state_dict — extract only GRU params
-                    gru_state = {k: v for k, v in state.items()
+                    gru_state = {k: v for k, v in peek_state.items()
                                  if 'bottleneck_gru' in k}
                     self.net.load_state_dict(gru_state, strict=False)
                 else:
                     # GRU-only state_dict
-                    self.net.bottleneck_gru.load_state_dict(state)
+                    self.net.bottleneck_gru.load_state_dict(peek_state)
 
         self.net.to(device)
         if perturbation_type == 'gru':

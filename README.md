@@ -123,10 +123,6 @@ To download the public models instead (SeaDronesSee, DroneCrowd, MTSD, ZebraFish
 docker compose run --rm segtrack bash scripts/download_models.sh
 ```
 
-Note the `bash` prefix. The upstream scripts have no `#!` line, so Docker cannot
-execute them directly — `./scripts/download_models.sh` fails with `exec format
-error`. The same applies to every script under `scripts/`.
-
 These paths are not guessed by the program — they come from two registry files:
 
 * `detector/configs/__init__.py` → the `DETECTION_MODELS` dictionary
